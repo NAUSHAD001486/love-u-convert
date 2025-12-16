@@ -12,6 +12,12 @@ const app = express();
 app.use(express.json());
 app.use(requestIdMiddleware);
 app.use(corsMiddleware);
+
+// Root route for Elastic Beanstalk health checks
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'love-u-convert-api' });
+});
+
 app.use(healthRoutes);
 app.use(convertRoutes);
 app.use(adminRoutes);
@@ -19,4 +25,3 @@ app.use(notFound);
 app.use(errorHandler);
 
 export { app };
-
