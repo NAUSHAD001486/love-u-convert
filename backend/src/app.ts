@@ -6,21 +6,31 @@ import { notFound } from './middlewares/notFound';
 import healthRoutes from './routes/health.routes';
 import convertRoutes from './routes/convert.routes';
 import adminRoutes from './routes/admin.routes';
+import docsRoutes from './routes/docs.routes';
 
 const app = express();
 
-app.use(express.json());
-app.use(requestIdMiddleware);
 app.use(corsMiddleware);
+app.use(requestIdMiddleware);
 
-// Root route for Elastic Beanstalk health checks
+// health check (no body parsing)
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'love-u-convert-api' });
+  res.json({ status: 'ok' });
 });
 
-app.use(healthRoutes);
+// multipart routes MUST come BEFORE express.json
 app.use(convertRoutes);
+
+// now safe to parse JSON bodies
+app.use(express.json());
+
+// API documentation (Swagger UI)
+app.use('/docs', docsRoutes);
+
+// remaining routes
+app.use(healthRoutes);
 app.use(adminRoutes);
+
 app.use(notFound);
 app.use(errorHandler);
 

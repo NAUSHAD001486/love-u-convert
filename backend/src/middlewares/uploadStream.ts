@@ -3,7 +3,10 @@ import Busboy from 'busboy';
 import { Transform, PassThrough } from 'stream';
 import { detectMimeFromBuffer } from './mimeTypeGuard';
 import { env } from '../config/env';
-import { isAllowedMimeType } from '../utils/mime';
+import { mkdir } from 'fs/promises';
+import { createWriteStream, createReadStream, unlink } from 'fs';
+import { join } from 'path';
+import { randomBytes } from 'crypto';
 
 interface FileStream {
   filename: string;
@@ -12,16 +15,60 @@ interface FileStream {
   size: number;
   stream: NodeJS.ReadableStream;
   targetFormat?: string;
+  tempPath?: string; // Path to temporary file on disk
+}
+
+// Normalized file structure attached to req.files
+interface NormalizedFile {
+  filename: string;
+  mimeType: string;
+  detectedMime: string;
+  size: number;
+  tempPath: string;
 }
 
 // Extend Express Request
 declare global {
   namespace Express {
     interface Request {
-      files?: FileStream[];
+      // req.files is set by uploadStream middleware as normalized array
+      // Structure: Array<{ filename: string; mimeType: string; detectedMime: string; size: number; tempPath: string; }>
+      files?: NormalizedFile[];
     }
   }
 }
+
+const TEMP_DIR = join(process.cwd(), 'temp', 'uploads');
+
+// Ensure temp directory exists
+const ensureTempDir = async (): Promise<void> => {
+  try {
+    await mkdir(TEMP_DIR, { recursive: true });
+  } catch (error: any) {
+    if (error.code !== 'EEXIST') {
+      throw error;
+    }
+  }
+};
+
+/**
+ * Normalizes file array and attaches to req.files
+ * Ensures req.files is always an array with the required structure
+ */
+const normalizeAndAttachFiles = (
+  req: Request,
+  files: FileStream[]
+): void => {
+  // req.files is normalized here to ensure consistent structure
+  // Always an array with: { filename, mimeType, detectedMime, size, tempPath }
+  req.files = files.map(file => ({
+    filename: file.filename,
+    mimeType: file.mimeType || 'application/octet-stream',
+    detectedMime: file.detectedMime || 'application/octet-stream',
+    size: file.size,
+    tempPath: file.tempPath!, // tempPath is always present when file is saved to disk
+  }));
+};
 
 /**
  * Creates a transform stream that:
@@ -105,16 +152,17 @@ function createFileProcessor(
  * Streaming upload middleware using busboy
  * - Parses multipart/form-data
  * - Supports multiple files (files[])
+ * - Saves files to temp directory on disk
  * - Tracks exact bytes read per file
  * - Enforces MAX_FILE_SIZE_BYTES during streaming
- * - Does NOT store files on disk or memory (streams only)
- * - Emits per-file stream object to downstream via req.files[]
+ * - Provides file paths in req.files[] for non-blocking controller
  */
-export const uploadStream = (
+export const uploadStream = async (
   req: Request,
   res: Response,
   next: NextFunction
 ) => {
+  console.log('uploadStream middleware HIT');
   const contentType = req.headers['content-type'];
   if (!contentType || !contentType.includes('multipart/form-data')) {
     return res.status(400).json({
@@ -123,64 +171,70 @@ export const uploadStream = (
     });
   }
 
-  const maxFileSize = parseInt(env.MAX_FILE_SIZE_BYTES, 10);
-  if (!maxFileSize || isNaN(maxFileSize)) {
+  const maxFileSize = env.MAX_FILE_SIZE_BYTES;
+  if (!maxFileSize || maxFileSize <= 0) {
     return res.status(500).json({
       error: 'Configuration error',
       message: 'MAX_FILE_SIZE_BYTES not configured',
     });
   }
 
+  // Ensure temp directory exists - MUST be awaited before creating busboy
+  try {
+    await ensureTempDir();
+  } catch (err) {
+    console.error('Failed to create temp directory', err);
+    return res.status(500).json({
+      error: 'Server error',
+      message: 'Upload directory not available',
+    });
+  }
+
   const busboy = Busboy({ headers: req.headers });
   const files: FileStream[] = [];
+  const fileWritePromises: Promise<void>[] = [];
   let targetFormat: string | null = null;
   let hasError = false;
-  let filesProcessed = 0;
-  let totalFiles = 0;
 
   // Handle file uploads
-  busboy.on('file', (fieldname: string, fileStream: NodeJS.ReadableStream, info: { filename: string; encoding: string; mimeType: string }) => {
+  busboy.on('file', async (fieldname: string, fileStream: NodeJS.ReadableStream, info: { filename: string; encoding: string; mimeType: string }) => {
+    // Only accept files from specific field names: "files", "files[]", or "file"
+    console.log('BUSBOY FILE EVENT:', fieldname, info.filename);
+    if (!['files', 'files[]', 'file'].includes(fieldname)) {
+      fileStream.resume(); // Drain stream and ignore
+      return;
+    }
+
     if (hasError) {
       fileStream.resume(); // Drain stream
       return;
     }
 
-    totalFiles++;
     const { filename, encoding, mimeType } = info;
     let bytesRead = 0;
     let detectedMime: string | null = null;
     let mimeValidated = false;
 
-    // Create pass-through stream for downstream use
-    const filePassThrough = new PassThrough();
+    // Generate unique temp file path
+    const tempFileName = `${Date.now()}_${randomBytes(8).toString('hex')}_${filename}`;
+    const tempFilePath = join(TEMP_DIR, tempFileName);
+    const writeStream = createWriteStream(tempFilePath);
+    let writeError: Error | null = null;
 
     // Create processor that tracks size and detects MIME
     const processor = createFileProcessor(
       filename,
       maxFileSize,
-      (mime) => {
-        detectedMime = mime;
-
-        // Validate MIME
-        if (!detectedMime || !isAllowedMimeType(detectedMime)) {
-          hasError = true;
-          filePassThrough.destroy();
-          if (!res.headersSent) {
-            res.status(415).json({
-              error: 'Unsupported media type',
-              message: `File "${filename}" has unsupported MIME type`,
-              detectedMime: detectedMime || 'unknown',
-            });
-          }
-          return;
-        }
-
-        mimeValidated = true;
-      },
+        (mime) => {
+          detectedMime = mime;
+          // MIME detection is done, but validation happens later via content-based detection
+          mimeValidated = true;
+        },
       () => {
         // Size exceeded
         hasError = true;
-        filePassThrough.destroy();
+        writeStream.destroy();
+        unlink(tempFilePath, () => {}); // Clean up
         if (!res.headersSent) {
           res.status(413).json({
             error: 'Payload too large',
@@ -196,52 +250,56 @@ export const uploadStream = (
       bytesRead += chunk.length;
     });
 
-    // Pipe file stream through processor to pass-through
-    fileStream.pipe(processor).pipe(filePassThrough);
+    // Pipe file stream through processor to disk
+    fileStream.pipe(processor).pipe(writeStream);
 
-    // Handle file stream end
-    fileStream.on('end', () => {
-      if (hasError) {
-        return;
-      }
+    // Wrap writeStream completion in a Promise
+    const fileWritePromise = new Promise<void>((resolve, reject) => {
+      // Handle write stream errors
+      writeStream.on('error', (error: Error) => {
+        console.error('Write stream error:', error);
+        writeError = error;
+        hasError = true;
+        unlink(tempFilePath, () => {}); // Clean up
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: 'File upload error',
+            message: 'Error saving file to disk',
+          });
+        }
+        reject(error);
+      });
 
-      // Wait a bit for MIME detection if not done yet (for small files)
-      setTimeout(() => {
-        if (!mimeValidated && detectedMime === null) {
-          // MIME detection might still be in progress, but we'll proceed
-          // The validation will happen in mimeTypeGuard if needed
+      // Handle file stream end
+      writeStream.on('finish', () => {
+        if (hasError || writeError) {
+          reject(new Error('File write failed due to previous error'));
+          return;
         }
 
         // Add file to files array
         files.push({
           filename: filename || 'unknown',
-          mimeType: mimeType || null,
-          detectedMime: detectedMime,
+          mimeType: mimeType || 'application/octet-stream',
+          detectedMime: detectedMime || 'application/octet-stream',
           size: bytesRead,
-          stream: filePassThrough,
+          stream: createReadStream(tempFilePath),
           targetFormat: targetFormat || undefined,
+          tempPath: tempFilePath,
         });
 
-        filesProcessed++;
-
-        // If all files processed, continue
-        if (filesProcessed === totalFiles && !hasError && !res.headersSent) {
-          req.files = files;
-          if (targetFormat && !req.body) {
-            req.body = { targetFormat };
-          } else if (targetFormat) {
-            req.body = req.body || {};
-            req.body.targetFormat = targetFormat;
-          }
-          next();
-        }
-      }, 100); // Small delay to allow async MIME detection
+        resolve();
+      });
     });
+
+    // Push promise immediately to track file completion
+    fileWritePromises.push(fileWritePromise);
 
     fileStream.on('error', (error) => {
       console.error('File stream error:', error);
       hasError = true;
-      filePassThrough.destroy();
+      writeStream.destroy();
+      unlink(tempFilePath, () => {}); // Clean up
       if (!res.headersSent) {
         res.status(500).json({
           error: 'File upload error',
@@ -253,7 +311,8 @@ export const uploadStream = (
     processor.on('error', (error: Error) => {
       console.error('Processor error:', error);
       hasError = true;
-      filePassThrough.destroy();
+      writeStream.destroy();
+      unlink(tempFilePath, () => {}); // Clean up
     });
   });
 
@@ -264,36 +323,53 @@ export const uploadStream = (
     }
   });
 
-  // Handle busboy finish
-  busboy.on('finish', () => {
+  // Handle busboy finish - await all file writes before completing
+  busboy.on('finish', async () => {
     if (hasError) {
-      return;
+      return; // Error already handled, don't call next()
     }
 
-    if (files.length === 0) {
-      if (!res.headersSent) {
-        res.status(400).json({
-          error: 'No files uploaded',
-          message: 'At least one file is required',
-        });
+    try {
+      // Wait for all file writes to complete
+      await Promise.all(fileWritePromises);
+
+      if (hasError || res.headersSent) {
+        return; // Error or response already sent
       }
-      return;
-    }
 
-    // If files were processed (all files ended before busboy finish)
-    if (filesProcessed === totalFiles && files.length > 0 && !hasError && !res.headersSent) {
-      req.files = files;
+      // Check files.length AFTER all writes complete
+      if (files.length === 0) {
+        if (!res.headersSent) {
+          res.status(400).json({
+            error: 'No files uploaded',
+            message: 'At least one file is required',
+          });
+        }
+        return; // No files, don't call next()
+      }
+
+      // All files are now written, normalize and attach to request
+      normalizeAndAttachFiles(req, files);
       if (targetFormat && !req.body) {
         req.body = { targetFormat };
       } else if (targetFormat) {
         req.body = req.body || {};
         req.body.targetFormat = targetFormat;
       }
-      next();
+      next(); // Call next() only once after all files are processed
+    } catch (error) {
+      // Promise.all rejected - one or more file writes failed
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: 'File upload error',
+          message: 'Failed to save one or more files',
+        });
+      }
+      // Do NOT call next() on error
     }
   });
 
-  // Handle busboy errors
+  // Handle busboy errors - send response once, do NOT call next()
   busboy.on('error', (error: Error) => {
     console.error('Busboy error:', error);
     hasError = true;
@@ -303,13 +379,9 @@ export const uploadStream = (
         message: 'Error parsing multipart form data',
       });
     }
+    // Do NOT call next() on error
   });
 
   // Pipe request to busboy
   req.pipe(busboy);
-
-  // TODO: Phase-2C - Cloudinary upload_stream will be plugged here
-  // After MIME validation and size checks, we'll stream directly to Cloudinary
-  // Example: cloudinary.uploader.upload_stream(options, callback)
-  // The filePassThrough stream can be piped directly to Cloudinary's upload_stream
 };

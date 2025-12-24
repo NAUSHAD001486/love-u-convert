@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
 import { getRedisClient } from '../config/redis';
-import { env } from '../config/env';
 import { extractClientIP } from '../utils/ip';
 import { getSecondsUntilMidnightUTC, getCurrentEpochSeconds } from '../utils/time';
 import { readFileSync } from 'fs';
@@ -19,7 +18,6 @@ const loadLuaScript = async (): Promise<string | null> => {
   }
 
   try {
-    // Try multiple possible paths (dev and production)
     const possiblePaths = [
       join(__dirname, '../scripts/redis-lua/quota_and_tokens.lua'),
       join(process.cwd(), 'src/scripts/redis-lua/quota_and_tokens.lua'),
@@ -32,7 +30,7 @@ const loadLuaScript = async (): Promise<string | null> => {
         script = readFileSync(scriptPath, 'utf-8');
         break;
       } catch {
-        // Try next path
+        continue;
       }
     }
 
@@ -54,8 +52,6 @@ interface QuotaResult {
   reason?: string;
   quota_used?: number;
   quota_limit?: number;
-  tokens_remaining?: number;
-  tokens_per_second?: number;
 }
 
 export const dailyQuotaRedis = async (
@@ -65,43 +61,34 @@ export const dailyQuotaRedis = async (
 ) => {
   const redis = getRedisClient();
   if (!redis) {
-    // Fail-open: allow request if Redis is unavailable
-    console.error('Redis not available, skipping daily quota check');
-    return next();
-  }
-
-  const dailyBytesLimit = parseInt(env.DAILY_BYTES_LIMIT, 10);
-  if (!dailyBytesLimit || isNaN(dailyBytesLimit)) {
-    console.error('DAILY_BYTES_LIMIT not configured or invalid');
+    console.warn('Rate limiter unavailable, allowing request');
     return next();
   }
 
   const clientIP = extractClientIP(req);
-  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
-  const bytesToAdd = contentLength || 0;
-
-  // Validate file size
-  const maxFileSize = parseInt(env.MAX_FILE_SIZE_BYTES, 10);
-  if (maxFileSize && !isNaN(maxFileSize) && bytesToAdd > maxFileSize) {
-    return res.status(413).json({
-      error: 'File too large',
-      message: `File size exceeds maximum allowed size of ${maxFileSize} bytes`,
-    });
+  const dailyBytesLimit = 1610612736;
+  
+  let bytesToAdd = 0;
+  if ((req as any).files && Array.isArray((req as any).files)) {
+    bytesToAdd = (req as any).files.reduce((sum: number, file: any) => sum + (file.size || 0), 0);
+  } else {
+    const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+    bytesToAdd = contentLength || 0;
   }
 
   try {
     const scriptSha = await loadLuaScript();
     if (!scriptSha) {
-      console.error('Failed to load Lua script, allowing request');
+      console.warn('Rate limiter unavailable, allowing request');
       return next();
     }
 
     const nowSeconds = getCurrentEpochSeconds();
     const secondsUntilMidnight = getSecondsUntilMidnightUTC();
-    const tokensPerSecond = 5; // Rate limit: 5 files per second
+    const tokensPerSecond = 999;
 
     const dailyQuotaKey = `quota:daily:${clientIP}:${new Date().toISOString().split('T')[0]}`;
-    const tokenBucketKey = `tokens:${clientIP}`;
+    const tokenBucketKey = `tokens:quota:${clientIP}`;
 
     const result = await redis.evalsha(
       scriptSha,
@@ -119,33 +106,25 @@ export const dailyQuotaRedis = async (
 
     if (parsedResult.allowed === 0) {
       if (parsedResult.reason === 'DAILY_QUOTA_EXCEEDED') {
+        const retryAfter = Math.ceil(secondsUntilMidnight / 60);
+        res.setHeader('Retry-After', retryAfter.toString());
         return res.status(429).json({
           error: 'Daily quota exceeded',
-          message: `Daily quota of ${dailyBytesLimit} bytes has been exceeded`,
+          message: 'Daily quota of 1.5 GB has been exceeded',
           quota_used: parsedResult.quota_used,
           quota_limit: parsedResult.quota_limit,
         });
       }
-      if (parsedResult.reason === 'RATE_LIMIT_EXCEEDED') {
-        return res.status(429).json({
-          error: 'Rate limit exceeded',
-          message: `Maximum ${tokensPerSecond} requests per second allowed`,
-          tokens_per_second: parsedResult.tokens_per_second,
-        });
-      }
     }
 
-    // Attach quota info to request for downstream use
     (req as any).quotaInfo = {
       quotaUsed: parsedResult.quota_used,
       quotaLimit: parsedResult.quota_limit,
-      tokensRemaining: parsedResult.tokens_remaining,
     };
 
     next();
   } catch (error) {
-    console.error('Redis quota check error:', error);
-    // Fail-open: allow request on error
+    console.warn('Rate limiter unavailable, allowing request');
     return next();
   }
 };

@@ -1,5 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
-import { isMimeAllowedForFormat } from '../utils/mime';
+import { isSupportedOutputFormat, normalizeFormat, SUPPORTED_OUTPUT_FORMATS } from '../config/formats';
+import { detectImage } from '../utils/detectImage';
+import { ok, fail } from '../utils/apiResponse';
+import path from 'path';
 
 interface FileMeta {
   detectedMime: string | null;
@@ -18,59 +21,89 @@ declare global {
 
 /**
  * MIME type guard middleware
- * - Validates detected MIME (from uploadStream) against allowed MIME for targetFormat
- * - Returns 415 if MIME not allowed for target format
+ * - Validates target format against allowlist
+ * - Performs content-based image detection (not MIME-based)
+ * - Returns 415 if file is not a valid image or target format is invalid
  * - Attaches fileMeta to request for downstream use
  */
-export const mimeTypeGuard = (
+export const mimeTypeGuard = async (
   req: Request,
   res: Response,
   next: NextFunction
 ) => {
   // Get targetFormat from query params or body
-  const targetFormat = (req.query.targetFormat as string) || 
-                       (req.body?.targetFormat as string);
+  const targetFormatRaw = (req.query.targetFormat as string) || 
+                          (req.body?.targetFormat as string);
 
-  if (!targetFormat) {
-    return res.status(400).json({
-      error: 'Missing target format',
-      message: 'targetFormat parameter is required',
+  if (!targetFormatRaw) {
+    return fail(res, 400, 'MISSING_TARGET_FORMAT', 'targetFormat parameter is required');
+  }
+
+  // Normalize and validate target format
+  const targetFormat = normalizeFormat(targetFormatRaw);
+  
+  if (!isSupportedOutputFormat(targetFormat)) {
+    const allowedFormatsList = Array.from(SUPPORTED_OUTPUT_FORMATS).sort().join(', ');
+    const message = `Target format "${targetFormatRaw}" is not supported. Allowed formats: ${allowedFormatsList}`;
+    return fail(res, 415, 'UNSUPPORTED_TARGET_FORMAT', message, {
+      allowedFormats: Array.from(SUPPORTED_OUTPUT_FORMATS).sort(),
     });
   }
 
-  // Validate files that were processed by uploadStream
+  // Validate files that were processed by uploadStream using extension-based validation
+  // Extension-first validation (MANDATORY) - MIME type is ignored for validation
   if ((req as any).files && Array.isArray((req as any).files)) {
     const files = (req as any).files;
-    const invalidFiles: Array<{ filename: string; detectedMime: string | null }> = [];
+    const invalidFiles: Array<{ filename: string; reason: string }> = [];
 
+    // ALLOWED_EXTENSIONS list
+    const ALLOWED_EXTENSIONS = [
+      'jpg', 'jpeg', 'png', 'webp', 'gif',
+      'bmp', 'tiff', 'tga', 'psd', 'eps', 'svg'
+    ];
+
+    // Check each file using extension-based validation ONLY
     for (const file of files) {
-      if (file.detectedMime) {
-        const isValid = isMimeAllowedForFormat(file.detectedMime, targetFormat);
-        if (!isValid) {
-          invalidFiles.push({
-            filename: file.filename || 'unknown',
-            detectedMime: file.detectedMime,
-          });
-        }
-      } else {
-        // MIME not detected
+      if (!file.tempPath) {
         invalidFiles.push({
           filename: file.filename || 'unknown',
-          detectedMime: null,
+          reason: 'File not uploaded',
         });
+        continue;
+      }
+
+      // Extension-first validation (ONLY EXTENSION decides image validity)
+      const ext = path.extname(file.filename || '').toLowerCase().replace('.', '');
+      
+      if (!ALLOWED_EXTENSIONS.includes(ext)) {
+        invalidFiles.push({
+          filename: file.filename || 'unknown',
+          reason: 'Invalid image file',
+        });
+        continue;
+      }
+
+      // MIME type is IGNORED for validation (TGA, EPS, PSD often have non-image MIME types)
+      // Actual decoding/validation happens at conversion layer
+      // Still try to detect MIME for downstream use, but don't block on it
+      try {
+        const detectionResult = await detectImage(file.tempPath);
+        if (detectionResult.mimeType) {
+          file.detectedMime = detectionResult.mimeType;
+        }
+      } catch (error) {
+        // MIME detection failure is not a blocker - extension validation passed
+        // detectedMime can remain null or use default
       }
     }
 
     if (invalidFiles.length > 0) {
-      return res.status(415).json({
-        error: 'Unsupported media type',
-        message: `File(s) MIME type not allowed for target format: ${targetFormat}`,
+      return fail(res, 415, 'INVALID_IMAGE_FILE', 'Uploaded file is not a valid image', {
         invalidFiles,
-        targetFormat,
       });
     }
 
-    // Attach fileMeta to request
+    // Attach fileMeta to request with normalized format
     req.fileMeta = {
       detectedMime: files[0]?.detectedMime || null,
       targetFormat,

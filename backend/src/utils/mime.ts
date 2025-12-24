@@ -37,12 +37,25 @@ export const isMimeAllowedForFormat = (
     return false;
   }
 
-  const allowedMimes = formatToMimeTypes[targetFormat.toLowerCase()];
-  if (!allowedMimes) {
+  // Error should occur ONLY when detectedMime is NOT an image/*
+  if (!detectedMime.startsWith('image/')) {
     return false;
   }
 
-  return allowedMimes.includes(detectedMime);
+  // Check if target format is valid
+  const normalizedTarget = targetFormat.toLowerCase();
+  if (!formatToMimeTypes[normalizedTarget]) {
+    return false;
+  }
+
+  // Allow all image/* MIME types to be converted to any valid image format
+  // This enables conversions like:
+  // - image/png → webp
+  // - image/jpeg → webp
+  // - image/jpg → webp (treated as image/jpeg)
+  // - image/webp → png/jpeg/jpg
+  // - Any image/* → Any valid image format
+  return true;
 };
 
 /**
