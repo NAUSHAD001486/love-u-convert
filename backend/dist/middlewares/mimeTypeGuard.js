@@ -69,10 +69,11 @@ const mimeTypeGuard = async (req, res, next) => {
     if (req.files && Array.isArray(req.files)) {
         const files = req.files;
         const invalidFiles = [];
-        // ALLOWED_EXTENSIONS list
+        // ALLOWED_EXTENSIONS list (ICO and TGA enabled as input - will be normalized to PNG)
         const ALLOWED_EXTENSIONS = [
             'jpg', 'jpeg', 'png', 'webp', 'gif',
-            'bmp', 'tiff', 'tga', 'psd', 'eps', 'svg'
+            'bmp', 'tiff', 'psd', 'eps', 'svg',
+            'ico', 'tga'
         ];
         // Check each file using extension-based validation ONLY
         for (const file of files) {

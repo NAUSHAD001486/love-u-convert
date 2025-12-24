@@ -1,7 +1,6 @@
 import { createReadStream, unlink, mkdir, writeFileSync, existsSync } from 'fs';
 import { join, extname } from 'path';
 import { promisify } from 'util';
-import { execFile } from 'child_process';
 import { executeConversion, determineConversionRoute } from './conversionRouter.service';
 import { vectorizeToSvg } from './vectorize.service';
 import { downloadFileToDisk } from '../utils/downloadFile.util';
@@ -11,6 +10,7 @@ import { getUTCTimestamp } from '../utils/time';
 import { ConvertJobData } from '../queue/convert.queue';
 import { env } from '../config/env';
 import os from 'os';
+import sharp from 'sharp';
 
 const mkdirAsync = promisify(mkdir);
 
@@ -35,64 +35,49 @@ const cleanupTempFile = (tempPath: string): void => {
 };
 
 /**
- * Pre-convert TGA to PNG before Cloudinary (TGA not supported by Cloudinary)
- * Uses ImageMagick CLI for robust TGA decoding (supports RLE, indexed, Photoshop TGA)
- * Returns converted file path and updated MIME type, or original if not TGA
+ * Normalize ICO/TGA input to PNG using Sharp (safe input normalization)
+ * ICO and TGA are normalized to PNG before processing to ensure compatibility
+ * 
+ * @param inputPath - Path to input file
+ * @param ext - File extension (lowercase, without dot)
+ * @param tempFilesToCleanup - Array to track generated files for cleanup
+ * @returns Normalized PNG path if ICO/TGA, original path otherwise
+ * @throws Error if normalization fails
  */
-const preConvertTgaIfNeeded = async (
-  filePath: string,
-  filename: string,
+async function normalizeInputIfNeeded(
+  inputPath: string,
+  ext: string,
   tempFilesToCleanup: string[]
-): Promise<{ convertedPath: string; detectedMime: string | null }> => {
-  const ext = extname(filename).toLowerCase().replace('.', '');
-  
-  // Only convert TGA files
-  if (ext !== 'tga') {
-    return {
-      convertedPath: filePath,
-      detectedMime: null, // Keep original detectedMime
-    };
+): Promise<string> {
+  // Only normalize ICO and TGA files
+  if (ext !== 'ico' && ext !== 'tga') {
+    return inputPath;
   }
 
-  // Convert TGA → PNG using ImageMagick CLI (supports all TGA variants)
-  const pngPath = filePath.replace(/\.tga$/i, '.png');
+  // Generate PNG path (replace .ico or .tga with .png)
+  const pngPath = inputPath.replace(/\.(ico|tga)$/i, '.png');
   tempFilesToCleanup.push(pngPath); // Track for cleanup
 
   try {
-    // Use ImageMagick CLI: magick input.tga output.png
-    await new Promise<void>((resolve, reject) => {
-      execFile(
-        'magick',
-        [filePath, pngPath],
-        (error, stdout, stderr) => {
-          if (error) {
-            console.error(`ImageMagick TGA conversion failed: ${error.message}`);
-            reject(new Error('TGA file format is not supported for conversion'));
-            return;
-          }
-          
-          // Verify PNG file was created
-          if (!existsSync(pngPath)) {
-            reject(new Error('TGA file format is not supported for conversion'));
-            return;
-          }
-          
-          resolve();
-        }
-      );
-    });
+    // Convert ICO/TGA to PNG using Sharp
+    // failOnError: false allows graceful handling of unsupported variants
+    await sharp(inputPath, { failOnError: false })
+      .png({ quality: 100 })
+      .toFile(pngPath);
 
-    // Return converted PNG path and updated MIME
-    return {
-      convertedPath: pngPath,
-      detectedMime: 'image/png',
-    };
+    // Verify PNG was created
+    if (!existsSync(pngPath)) {
+      throw new Error(`${ext.toUpperCase()} input could not be decoded. Please convert it to PNG or JPG before uploading.`);
+    }
+
+    return pngPath;
   } catch (error) {
-    console.error(`Failed to convert TGA to PNG using ImageMagick: ${error}`);
-    // If conversion fails, throw clear error
-    throw new Error('TGA file format is not supported for conversion');
+    // Clear error message for unsupported ICO/TGA variants
+    throw new Error(
+      `${ext.toUpperCase()} input could not be decoded. Please convert it to PNG or JPG before uploading.`
+    );
   }
-};
+}
 
 /**
  * Normalize error to a human-readable string
@@ -222,31 +207,30 @@ const convertWithRetry = async (
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Step 0: Pre-convert TGA to PNG if needed (TGA not supported by Cloudinary)
-      const { convertedPath, detectedMime: updatedMime } = await preConvertTgaIfNeeded(
+      // Step 0: Normalize ICO/TGA input to PNG if needed (before any conversion)
+      const fileExt = extname(file.filename).toLowerCase().replace('.', '');
+      const normalizedInputPath = await normalizeInputIfNeeded(
         file.tempPath,
-        file.filename,
+        fileExt,
         tempFilesToCleanup
       );
-      const effectiveMime = updatedMime || file.detectedMime;
       
       // Step 1: Convert file using conversion router
       const publicId = `convert_${Date.now()}_${index}_${Math.random().toString(36).substring(7)}`;
       
       // Read file from disk as stream (streaming IO, no buffer-all)
-      // Use converted path if TGA was converted to PNG
-      const fileStream = createReadStream(convertedPath);
+      // Use normalized path (PNG for ICO/TGA, original for others)
+      const fileStream = createReadStream(normalizedInputPath);
       if (attempt === 1) {
         tempFilesToCleanup.push(file.tempPath);
-        // If TGA was converted, the PNG path is already in tempFilesToCleanup
       }
       
-      // Determine conversion route (use updated MIME for TGA→PNG conversion)
+      // Determine conversion route
       const route = determineConversionRoute({
         inputFormat: null,
         targetFormat,
         originalFilename: finalFilename,
-        detectedMime: effectiveMime,
+        detectedMime: file.detectedMime,
       });
 
       // Route: Raster → SVG (local vectorization - no Cloudinary, no retries)
@@ -256,16 +240,9 @@ const convertWithRetry = async (
         const outputPath = join(TEMP_DOWNLOAD_DIR, `${Date.now()}_${index}_${Math.random().toString(36).substring(7)}_${finalFilename}`);
         tempFilesToCleanup.push(outputPath);
 
-        // Pre-convert TGA to PNG if needed (before vectorization)
-        const { convertedPath: vectorizeInputPath } = await preConvertTgaIfNeeded(
-          file.tempPath,
-          file.filename,
-          tempFilesToCleanup
-        );
-
         // Vectorize locally (no retries - errors are non-retryable)
-        // Use converted PNG path if TGA was converted
-        await vectorizeToSvg(vectorizeInputPath, outputPath);
+        // Use normalized path (PNG for ICO/TGA, original for others)
+        await vectorizeToSvg(normalizedInputPath, outputPath);
 
         // Success: return local SVG file path
         return {
@@ -275,12 +252,12 @@ const convertWithRetry = async (
         };
       }
 
-      // All other routes: use Cloudinary (with updated MIME if TGA was converted)
+      // All other routes: use Cloudinary
       const result = await executeConversion(fileStream, {
         inputFormat: null,
         targetFormat,
         originalFilename: finalFilename,
-        detectedMime: effectiveMime,
+        detectedMime: file.detectedMime,
       }, publicId);
 
       if (!result || !('secure_url' in result) || !result.secure_url) {
@@ -364,27 +341,27 @@ export const processJob = async (jobData: ConvertJobData, jobId?: string): Promi
       const file = jobData.files[0];
       const publicId = `convert_${Date.now()}_${Math.random().toString(36).substring(7)}`;
       
-      // Pre-convert TGA to PNG if needed (TGA not supported by Cloudinary)
-      const { convertedPath, detectedMime: updatedMime } = await preConvertTgaIfNeeded(
+      // Normalize ICO/TGA input to PNG if needed (before any conversion)
+      const fileExt = extname(file.filename).toLowerCase().replace('.', '');
+      const normalizedInputPath = await normalizeInputIfNeeded(
         file.tempPath,
-        file.filename,
+        fileExt,
         tempFilesToCleanup
       );
-      const effectiveMime = updatedMime || file.detectedMime;
       
-      // Read file from disk as stream (use converted path if TGA was converted)
-      const fileStream = createReadStream(convertedPath);
+      // Read file from disk as stream (use normalized path)
+      const fileStream = createReadStream(normalizedInputPath);
       tempFilesToCleanup.push(file.tempPath);
 
       // Generate final filename using single source of truth (JPEG vs JPG fix)
       const singleFinalFilename = normalizeOutputFilename(file.filename, jobData.targetFormat);
       
-      // Determine route for single file (use updated MIME for TGA→PNG conversion)
+      // Determine route for single file
       const route = determineConversionRoute({
         inputFormat: null,
         targetFormat: jobData.targetFormat,
         originalFilename: singleFinalFilename,
-        detectedMime: effectiveMime,
+        detectedMime: file.detectedMime,
       });
 
       // Route: Raster → SVG (local vectorization)
@@ -394,15 +371,8 @@ export const processJob = async (jobData: ConvertJobData, jobId?: string): Promi
         const outputPath = join(TEMP_DOWNLOAD_DIR, `${Date.now()}_${Math.random().toString(36).substring(7)}_${singleFinalFilename}`);
         tempFilesToCleanup.push(outputPath);
         
-        // Pre-convert TGA to PNG if needed (before vectorization)
-        const { convertedPath: vectorizeInputPath } = await preConvertTgaIfNeeded(
-          file.tempPath,
-          file.filename,
-          tempFilesToCleanup
-        );
-        
-        // Vectorize locally (use converted PNG path if TGA was converted)
-        await vectorizeToSvg(vectorizeInputPath, outputPath);
+        // Vectorize locally (use normalized path - PNG for ICO/TGA, original for others)
+        await vectorizeToSvg(normalizedInputPath, outputPath);
         
         // Upload SVG to Cloudinary for download URL
         const svgStream = createReadStream(outputPath);
@@ -426,12 +396,12 @@ export const processJob = async (jobData: ConvertJobData, jobId?: string): Promi
         };
       }
 
-      // All other routes: use Cloudinary directly (with updated MIME if TGA was converted)
+      // All other routes: use Cloudinary directly
       const result = await executeConversion(fileStream, {
         inputFormat: null,
         targetFormat: jobData.targetFormat,
         originalFilename: singleFinalFilename,
-        detectedMime: effectiveMime,
+        detectedMime: file.detectedMime,
       }, publicId);
 
       // Clean up temp file
