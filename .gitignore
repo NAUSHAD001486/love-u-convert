@@ -7,3 +7,6 @@ node_modules/
 .elasticbeanstalk/
 .DS_Store
 logs/
+*.bin
+big.bin
+mid.bin
